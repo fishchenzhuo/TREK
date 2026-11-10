@@ -294,13 +294,13 @@ export class SynologyService {
     return result;
   }
 
-  private _normalizeSynologyPhotoInfo(item: SynologyPhotoItem): AssetInfo {
+  private _normalizeSynologyPhotoInfo(item: SynologyPhotoItem, team = false): AssetInfo {
     const address = item.additional?.address || {};
     const exif = item.additional?.exif || {};
     const gps = item.additional?.gps || {};
 
     return {
-      id: String(item.additional?.thumbnail?.cache_key || ''),
+      id: (team ? 't' : '') + String(item.additional?.thumbnail?.cache_key || ''),
       takenAt: item.time ? new Date(item.time * 1000).toISOString() : null,
       city: address.city || null,
       country: address.country || null,
@@ -330,12 +330,20 @@ export class SynologyService {
     await this.synologyRepo.clearSynologySession(userId);
   }
 
-  private _splitPackedSynologyId(rawId: string): { id: string; cacheKey: string; assetId: string } | null {
+  private _splitPackedSynologyId(
+    rawId: string,
+  ): { id: string; cacheKey: string; assetId: string; team: boolean } | null {
     // cache_key format from Synology is "{unit_id}_{timestamp}", e.g. "40808_1633659236".
     // The first segment must be a non-empty integer (the unit ID used for API calls).
-    if (!/^\d+_.+$/.test(rawId)) return null;
-    const id = rawId.split('_')[0];
-    return { id, cacheKey: rawId, assetId: rawId };
+    // Shared Space (FotoTeam) assets carry a "t" prefix — their unit ids live in a
+    // separate numbering space, so without the prefix they could collide with
+    // personal-space ids on the same server.
+    const m = /^(t?)(\d+)_(.+)$/.exec(rawId);
+    if (!m) return null;
+    const team = m[1] === 't';
+    const id = m[2];
+    const cacheKey = team ? rawId.slice(1) : rawId;
+    return { id, cacheKey, assetId: rawId, team };
   }
 
   private async _getSynologySession(userId: number): Promise<ServiceResult<string>> {
@@ -508,7 +516,7 @@ export class SynologyService {
   }
 
   async listSynologyAlbums(userId: number): Promise<ServiceResult<AlbumsList>> {
-    const [personal, shared, sharedWithMe] = await Promise.allSettled([
+    const [personal, shared, sharedWithMe, teamAlbums] = await Promise.allSettled([
       this._fetchAllSynologyAlbums(userId, { api: 'SYNO.Foto.Browse.Album', method: 'list', version: 4 }),
       this._fetchAllSynologyAlbums(userId, {
         api: 'SYNO.Foto.Browse.Album',
@@ -522,6 +530,7 @@ export class SynologyService {
         version: 1,
         additional: ['thumbnail', 'sharing_info'],
       }),
+      this._fetchAllSynologyAlbums(userId, { api: 'SYNO.FotoTeam.Browse.Album', method: 'list', version: 1 }),
     ]);
 
     const map = new Map<string, { id: string; albumName: string; assetCount: number; passphrase?: string }>();
@@ -529,6 +538,7 @@ export class SynologyService {
     const addAlbums = (
       result: PromiseSettledResult<ServiceResult<any[]>>,
       extractPassphrase: (a: any) => string | undefined,
+      prefix = '',
     ) => {
       if (result.status === 'rejected') return;
       const value = result.value;
@@ -537,7 +547,7 @@ export class SynologyService {
         return;
       }
       for (const album of value.data ?? []) {
-        const id = String(album.id);
+        const id = prefix + String(album.id);
         const passphrase = extractPassphrase(album);
         map.set(id, { id, albumName: album.name || '', assetCount: album.item_count || 0, passphrase });
       }
@@ -546,6 +556,7 @@ export class SynologyService {
     addAlbums(personal, () => undefined);
     addAlbums(shared, (a) => a.passphrase || undefined);
     addAlbums(sharedWithMe, (a) => a.passphrase || a.sharing_info?.passphrase || undefined);
+    addAlbums(teamAlbums, () => undefined, 't');
 
     if (map.size === 0 && personal.status === 'fulfilled' && !personal.value.success) {
       return personal.value as ServiceResult<AlbumsList>;
@@ -563,6 +574,9 @@ export class SynologyService {
     const allItems: SynologyPhotoItem[] = [];
     const pageSize = 50;
     let offset = 0;
+    // 共享空间相册的 id 带 t 前缀 (见 listSynologyAlbums),其条目走 FotoTeam 命名空间
+    const teamAlbum = albumId.startsWith('t') && !passphrase;
+    const teamAlbumId = teamAlbum ? albumId.slice(1) : albumId;
 
     while (true) {
       const params: ApiCallParams = passphrase
@@ -577,15 +591,25 @@ export class SynologyService {
             limit: pageSize,
             additional: ['thumbnail', 'gps'],
           }
-        : {
-            api: 'SYNO.Foto.Browse.Item',
-            method: 'list',
-            version: 1,
-            album_id: Number(albumId),
-            offset,
-            limit: pageSize,
-            additional: ['thumbnail', 'gps'],
-          };
+        : teamAlbum
+          ? {
+              api: 'SYNO.FotoTeam.Browse.Item',
+              method: 'list',
+              version: 1,
+              album_id: Number(teamAlbumId),
+              offset,
+              limit: pageSize,
+              additional: ['thumbnail', 'gps'],
+            }
+          : {
+              api: 'SYNO.Foto.Browse.Item',
+              method: 'list',
+              version: 1,
+              album_id: Number(albumId),
+              offset,
+              limit: pageSize,
+              additional: ['thumbnail', 'gps'],
+            };
       const result = await this._requestSynologyApi<{ list: SynologyPhotoItem[] }>(userId, params);
       if (!result.success) return result as ServiceResult<AssetsList>;
       const items = result.data.list || [];
@@ -596,7 +620,7 @@ export class SynologyService {
 
     const assets = allItems
       .map((item) => ({
-        id: String(item.additional?.thumbnail?.cache_key || item.id || ''),
+        id: (teamAlbum ? 't' : '') + String(item.additional?.thumbnail?.cache_key || item.id || ''),
         takenAt: item.time ? new Date(item.time * 1000).toISOString() : '',
         lat: typeof item.additional?.gps?.latitude === 'number' ? item.additional.gps.latitude : null,
         lng: typeof item.additional?.gps?.longitude === 'number' ? item.additional.gps.longitude : null,
@@ -624,6 +648,8 @@ export class SynologyService {
     const allItems: SynologyPhotoItem[] = [];
     const pageSize = 50;
     let offset = 0;
+    const teamAlbum = albumId.startsWith('t') && !passphrase;
+    const teamAlbumId = teamAlbum ? albumId.slice(1) : albumId;
 
     while (true) {
       const itemParams: ApiCallParams = passphrase
@@ -636,15 +662,25 @@ export class SynologyService {
             limit: pageSize,
             additional: ['thumbnail'],
           }
-        : {
-            api: 'SYNO.Foto.Browse.Item',
-            method: 'list',
-            version: 1,
-            album_id: Number(albumId),
-            offset,
-            limit: pageSize,
-            additional: ['thumbnail'],
-          };
+        : teamAlbum
+          ? {
+              api: 'SYNO.FotoTeam.Browse.Item',
+              method: 'list',
+              version: 1,
+              album_id: Number(teamAlbumId),
+              offset,
+              limit: pageSize,
+              additional: ['thumbnail'],
+            }
+          : {
+              api: 'SYNO.Foto.Browse.Item',
+              method: 'list',
+              version: 1,
+              album_id: Number(albumId),
+              offset,
+              limit: pageSize,
+              additional: ['thumbnail'],
+            };
 
       const result = await this._requestSynologyApi<{ list: SynologyPhotoItem[] }>(userId, itemParams);
 
@@ -658,7 +694,9 @@ export class SynologyService {
 
     const selection: Selection = {
       provider: SYNOLOGY_PROVIDER,
-      asset_ids: allItems.map((item) => String(item.additional?.thumbnail?.cache_key || '')).filter((id) => id),
+      asset_ids: allItems
+        .map((item) => (teamAlbum ? 't' : '') + String(item.additional?.thumbnail?.cache_key || ''))
+        .filter((id) => id),
       passphrase,
     };
 
@@ -708,19 +746,43 @@ export class SynologyService {
     const result = await this._requestSynologyApi<{ list: SynologyPhotoItem[] }>(userId, params);
     if (!result.success) return result as ServiceResult<AssetsList>;
 
-    const allItems = result.data.list || [];
+    const personalItems = result.data.list || [];
+
+    // Shared Space photos live behind the parallel SYNO.FotoTeam.* namespace and
+    // the personal search above never sees them. Ask the team namespace with the
+    // same parameters and merge. A user without Shared Space access gets an app
+    // error here — that must not cost them the personal results, so it only warns.
+    const teamParams: ApiCallParams = {
+      ...params,
+      api: 'SYNO.FotoTeam.Search.Search',
+    };
+    const teamResult = await this._requestSynologyApi<{ list: SynologyPhotoItem[] }>(userId, teamParams);
+    const teamItems = teamResult.success ? teamResult.data.list || [] : [];
+    if (!teamResult.success) {
+      console.warn('[Synology] shared space search skipped:', teamResult.error.message);
+    }
+
+    const allItems = [...personalItems, ...teamItems];
     // Deliberately no sort parameter upstream, on this path or the album one.
     // Synology documents none for Search.Search, and _fetchSynologyJson maps
     // every app code except 106/107/119 onto a 400 — a parameter one DSM build
     // rejects would take listing down entirely for that user. Both paths read
     // every page anyway, so ordering the mapped result costs nothing and
     // cannot fail.
-    const assets = sortAssetsByTakenAtDesc(allItems.map((item) => this._normalizeSynologyPhotoInfo(item)));
+    const assets = sortAssetsByTakenAtDesc([
+      ...personalItems.map((item) => this._normalizeSynologyPhotoInfo(item)),
+      ...teamItems.map((item) => this._normalizeSynologyPhotoInfo(item, true)),
+    ]);
+
+    // With two sources sharing one offset the page boundary can repeat or skip a
+    // handful of items — the picker tolerates that, and "a full page from either
+    // source" stays the honest hasMore signal.
+    const hasMore = personalItems.length === limit || teamItems.length === limit;
 
     return success({
       assets,
       total: allItems.length,
-      hasMore: allItems.length === limit,
+      hasMore,
     });
   }
 
@@ -746,11 +808,13 @@ export class SynologyService {
     // both are asked in turn, and only an item whose own thumbnail is this unit
     // counts: never a neighbour's capture time or GPS.
     const unit = Number(parsedId.id);
-    const own = await this._readItemOfUnit(targetUserId, unit, parsedId.id, passphrase);
+    const own = await this._readItemOfUnit(targetUserId, unit, parsedId.id, passphrase, parsedId.team);
     // The neighbour only when the library answered with another photo: a failed
     // call (an unreachable NAS) is passed on, not repeated against the next id.
     const found =
-      own.success && !own.data ? await this._readItemOfUnit(targetUserId, unit + 1, parsedId.id, passphrase) : own;
+      own.success && !own.data
+        ? await this._readItemOfUnit(targetUserId, unit + 1, parsedId.id, passphrase, parsedId.team)
+        : own;
     if (!found.success) return found as ServiceResult<AssetInfo>;
     if (!found.data) return fail('Photo not found', 404);
 
@@ -768,9 +832,10 @@ export class SynologyService {
     itemId: number,
     unitId: string,
     passphrase?: string,
+    team = false,
   ): Promise<ServiceResult<SynologyPhotoItem | null>> {
     const infoParams: ApiCallParams = {
-      api: 'SYNO.Foto.Browse.Item',
+      api: team ? 'SYNO.FotoTeam.Browse.Item' : 'SYNO.Foto.Browse.Item',
       method: 'get',
       version: 5,
       id: `[${itemId}]`,
@@ -809,7 +874,7 @@ export class SynologyService {
     if (!sid.data) return { error: 'Session ID missing', status: 500 };
 
     const params = new URLSearchParams({
-      api: 'SYNO.Foto.Thumbnail',
+      api: parsedId.team ? 'SYNO.FotoTeam.Thumbnail' : 'SYNO.Foto.Thumbnail',
       method: 'get',
       version: '2',
       mode: 'download',
@@ -881,7 +946,7 @@ export class SynologyService {
     // the journey grid on retina screens.
     const resolvedSize = kind === 'original' ? 'xl' : size || 'm';
     const params = new URLSearchParams({
-      api: 'SYNO.Foto.Thumbnail',
+      api: parsedId.team ? 'SYNO.FotoTeam.Thumbnail' : 'SYNO.Foto.Thumbnail',
       method: 'get',
       version: '2',
       mode: 'download',
