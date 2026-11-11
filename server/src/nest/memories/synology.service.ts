@@ -516,7 +516,7 @@ export class SynologyService {
   }
 
   async listSynologyAlbums(userId: number): Promise<ServiceResult<AlbumsList>> {
-    const [personal, shared, sharedWithMe, teamAlbums] = await Promise.allSettled([
+    const [personal, shared, sharedWithMe] = await Promise.allSettled([
       this._fetchAllSynologyAlbums(userId, { api: 'SYNO.Foto.Browse.Album', method: 'list', version: 4 }),
       this._fetchAllSynologyAlbums(userId, {
         api: 'SYNO.Foto.Browse.Album',
@@ -530,7 +530,6 @@ export class SynologyService {
         version: 1,
         additional: ['thumbnail', 'sharing_info'],
       }),
-      this._fetchAllSynologyAlbums(userId, { api: 'SYNO.FotoTeam.Browse.Album', method: 'list', version: 1 }),
     ]);
 
     const map = new Map<string, { id: string; albumName: string; assetCount: number; passphrase?: string }>();
@@ -538,7 +537,6 @@ export class SynologyService {
     const addAlbums = (
       result: PromiseSettledResult<ServiceResult<any[]>>,
       extractPassphrase: (a: any) => string | undefined,
-      prefix = '',
     ) => {
       if (result.status === 'rejected') return;
       const value = result.value;
@@ -547,7 +545,7 @@ export class SynologyService {
         return;
       }
       for (const album of value.data ?? []) {
-        const id = prefix + String(album.id);
+        const id = String(album.id);
         const passphrase = extractPassphrase(album);
         map.set(id, { id, albumName: album.name || '', assetCount: album.item_count || 0, passphrase });
       }
@@ -556,7 +554,10 @@ export class SynologyService {
     addAlbums(personal, () => undefined);
     addAlbums(shared, (a) => a.passphrase || undefined);
     addAlbums(sharedWithMe, (a) => a.passphrase || a.sharing_info?.passphrase || undefined);
-    addAlbums(teamAlbums, () => undefined, 't');
+    // 注意: 共享空间没有相册概念(是文件夹 Browse.Folder),SYNO.FotoTeam.Browse.Album
+    // 在 DSM 7.2.2 + Photos 1.9.1 上不存在(实测 code 102),故不列共享空间"相册"。
+    // 共享空间照片由时间线日期搜索(SYNCO 上方 FotoTeam.Search.Search)覆盖。
+
 
     if (map.size === 0 && personal.status === 'fulfilled' && !personal.value.success) {
       return personal.value as ServiceResult<AlbumsList>;
@@ -574,9 +575,6 @@ export class SynologyService {
     const allItems: SynologyPhotoItem[] = [];
     const pageSize = 50;
     let offset = 0;
-    // 共享空间相册的 id 带 t 前缀 (见 listSynologyAlbums),其条目走 FotoTeam 命名空间
-    const teamAlbum = albumId.startsWith('t') && !passphrase;
-    const teamAlbumId = teamAlbum ? albumId.slice(1) : albumId;
 
     while (true) {
       const params: ApiCallParams = passphrase
@@ -591,25 +589,15 @@ export class SynologyService {
             limit: pageSize,
             additional: ['thumbnail', 'gps'],
           }
-        : teamAlbum
-          ? {
-              api: 'SYNO.FotoTeam.Browse.Item',
-              method: 'list',
-              version: 1,
-              album_id: Number(teamAlbumId),
-              offset,
-              limit: pageSize,
-              additional: ['thumbnail', 'gps'],
-            }
-          : {
-              api: 'SYNO.Foto.Browse.Item',
-              method: 'list',
-              version: 1,
-              album_id: Number(albumId),
-              offset,
-              limit: pageSize,
-              additional: ['thumbnail', 'gps'],
-            };
+        : {
+            api: 'SYNO.Foto.Browse.Item',
+            method: 'list',
+            version: 1,
+            album_id: Number(albumId),
+            offset,
+            limit: pageSize,
+            additional: ['thumbnail', 'gps'],
+          };
       const result = await this._requestSynologyApi<{ list: SynologyPhotoItem[] }>(userId, params);
       if (!result.success) return result as ServiceResult<AssetsList>;
       const items = result.data.list || [];
@@ -620,7 +608,7 @@ export class SynologyService {
 
     const assets = allItems
       .map((item) => ({
-        id: (teamAlbum ? 't' : '') + String(item.additional?.thumbnail?.cache_key || item.id || ''),
+        id: String(item.additional?.thumbnail?.cache_key || item.id || ''),
         takenAt: item.time ? new Date(item.time * 1000).toISOString() : '',
         lat: typeof item.additional?.gps?.latitude === 'number' ? item.additional.gps.latitude : null,
         lng: typeof item.additional?.gps?.longitude === 'number' ? item.additional.gps.longitude : null,
@@ -648,8 +636,6 @@ export class SynologyService {
     const allItems: SynologyPhotoItem[] = [];
     const pageSize = 50;
     let offset = 0;
-    const teamAlbum = albumId.startsWith('t') && !passphrase;
-    const teamAlbumId = teamAlbum ? albumId.slice(1) : albumId;
 
     while (true) {
       const itemParams: ApiCallParams = passphrase
@@ -662,25 +648,15 @@ export class SynologyService {
             limit: pageSize,
             additional: ['thumbnail'],
           }
-        : teamAlbum
-          ? {
-              api: 'SYNO.FotoTeam.Browse.Item',
-              method: 'list',
-              version: 1,
-              album_id: Number(teamAlbumId),
-              offset,
-              limit: pageSize,
-              additional: ['thumbnail'],
-            }
-          : {
-              api: 'SYNO.Foto.Browse.Item',
-              method: 'list',
-              version: 1,
-              album_id: Number(albumId),
-              offset,
-              limit: pageSize,
-              additional: ['thumbnail'],
-            };
+        : {
+            api: 'SYNO.Foto.Browse.Item',
+            method: 'list',
+            version: 1,
+            album_id: Number(albumId),
+            offset,
+            limit: pageSize,
+            additional: ['thumbnail'],
+          };
 
       const result = await this._requestSynologyApi<{ list: SynologyPhotoItem[] }>(userId, itemParams);
 
@@ -694,9 +670,7 @@ export class SynologyService {
 
     const selection: Selection = {
       provider: SYNOLOGY_PROVIDER,
-      asset_ids: allItems
-        .map((item) => (teamAlbum ? 't' : '') + String(item.additional?.thumbnail?.cache_key || ''))
-        .filter((id) => id),
+      asset_ids: allItems.map((item) => String(item.additional?.thumbnail?.cache_key || '')).filter((id) => id),
       passphrase,
     };
 

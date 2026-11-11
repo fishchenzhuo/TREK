@@ -35,6 +35,6 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ghcr.io/fishchenzhuo/trek-patched:5.1.2-sharedspace
+            ghcr.io/fishchenzhuo/trek-patched:5.1.2-sharedspace.2
           cache-from: type=gha
           cache-to: type=gha,mode=max
